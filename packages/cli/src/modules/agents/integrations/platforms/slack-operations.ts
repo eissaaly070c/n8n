@@ -132,8 +132,10 @@ export async function executeSlackContextQuery(params: {
 	input: Record<string, unknown>;
 }): Promise<unknown> {
 	if (params.query === 'get_user') {
+		const getUser = params.chat.getUser;
+		if (!getUser) return unsupportedQuery(PLATFORM, params.query);
 		const input = getUserSchema.parse(params.input);
-		const user = await params.chat.getUser(input.userId);
+		const user = await getUser(input.userId);
 		return { ok: true, user };
 	}
 
