@@ -36,6 +36,12 @@ import { useResourceRegistry } from './useResourceRegistry';
 import { useResponseFeedback } from './useResponseFeedback';
 import { getLatestBuildResult } from './canvasPreview.utils';
 
+export interface PlanEditContext {
+	requestId: string;
+	inputThreadId?: string;
+	taskCount: number;
+}
+
 export interface PendingConfirmationItem {
 	toolCall: InstanceAiToolCallState & { confirmation: InstanceAiConfirmation };
 	agentNode: InstanceAiAgentNode;
@@ -64,7 +70,7 @@ export interface ThreadRuntimeHooks {
 function collectPendingConfirmations(
 	node: InstanceAiAgentNode,
 	messageId: string,
-	resolved: Map<string, 'approved' | 'denied' | 'deferred'>,
+	resolved: Map<string, 'approved' | 'changes-requested' | 'denied' | 'deferred'>,
 	out: PendingConfirmationItem[],
 ): void {
 	for (const tc of node.toolCalls) {
@@ -238,12 +244,16 @@ export function createThreadRuntime(threadId: string, hooks: ThreadRuntimeHooks)
 	const archivedWorkflowIds = ref<Set<string>>(new Set());
 	const latestTasks = ref<TaskList | null>(null);
 	const debugEvents = ref<Array<{ timestamp: string; event: InstanceAiEvent }>>([]);
-	const resolvedConfirmationIds = ref<Map<string, 'approved' | 'denied' | 'deferred'>>(new Map());
+	const resolvedConfirmationIds = reactive(
+		new Map<string, 'approved' | 'changes-requested' | 'denied' | 'deferred'>(),
+	);
 	const pendingMessageCount = ref(0);
 	const hydrationStatus = ref<'idle' | 'hydrating' | 'ready'>('idle');
 	const sseState = ref<InstanceAiSSEConnectionState>('disconnected');
 	const lastEventId = ref<number | undefined>(undefined);
 	const amendContext = ref<{ agentId: string; role: string } | null>(null);
+	const activePlanEdit = ref<PlanEditContext | null>(null);
+	const updatingPlanRequestIds = reactive(new Set<string>());
 
 	// --- Non-reactive runtime state ---
 	let runStateByGroupId: Record<string, AgentRunState> = {};
@@ -304,7 +314,7 @@ export function createThreadRuntime(threadId: string, hooks: ThreadRuntimeHooks)
 		const items: PendingConfirmationItem[] = [];
 		for (const msg of messages.value) {
 			if (msg.role !== 'assistant' || !msg.agentTree) continue;
-			collectPendingConfirmations(msg.agentTree, msg.id, resolvedConfirmationIds.value, items);
+			collectPendingConfirmations(msg.agentTree, msg.id, resolvedConfirmationIds, items);
 		}
 		return items;
 	});
@@ -314,11 +324,9 @@ export function createThreadRuntime(threadId: string, hooks: ThreadRuntimeHooks)
 
 	function resolveConfirmation(
 		requestId: string,
-		action: 'approved' | 'denied' | 'deferred',
+		action: 'approved' | 'changes-requested' | 'denied' | 'deferred',
 	): void {
-		const next = new Map(resolvedConfirmationIds.value);
-		next.set(requestId, action);
-		resolvedConfirmationIds.value = next;
+		resolvedConfirmationIds.set(requestId, action);
 	}
 
 	/** Find a tool call by its confirmation requestId across all messages. */
@@ -370,7 +378,7 @@ export function createThreadRuntime(threadId: string, hooks: ThreadRuntimeHooks)
 			if (sessionAlwaysAllowKeys.value.size === 0) return;
 			for (const item of items) {
 				const conf = item.toolCall.confirmation;
-				if (resolvedConfirmationIds.value.has(conf.requestId)) continue;
+				if (resolvedConfirmationIds.has(conf.requestId)) continue;
 				if (autoApproveInFlight.has(conf.requestId)) continue;
 				if (!isGenericApprovalEligible(item)) continue;
 				const key = buildAlwaysAllowKey(item.toolCall.toolName, item.toolCall.args ?? {});
@@ -619,7 +627,7 @@ export function createThreadRuntime(threadId: string, hooks: ThreadRuntimeHooks)
 		activeRunId.value = null;
 		debugEvents.value = [];
 		resetFeedback();
-		resolvedConfirmationIds.value = new Map();
+		resolvedConfirmationIds.clear();
 		sessionAlwaysAllowKeys.value = new Set();
 		runStateByGroupId = {};
 		groupIdByRunId = {};
@@ -838,6 +846,32 @@ export function createThreadRuntime(threadId: string, hooks: ThreadRuntimeHooks)
 		amendContext.value = { agentId, role };
 	}
 
+	// --- Plan edit mode ---
+
+	function startPlanEdit(context: PlanEditContext): void {
+		activePlanEdit.value = context;
+	}
+
+	function cancelPlanEdit(): void {
+		activePlanEdit.value = null;
+	}
+
+	function markPlanUpdatePending(requestId: string): void {
+		updatingPlanRequestIds.add(requestId);
+	}
+
+	function clearPlanUpdatePending(requestId: string): void {
+		updatingPlanRequestIds.delete(requestId);
+	}
+
+	// Defensive cleanup: if a stream ends without a matching clear, drop the
+	// pending markers so we don't leave a card stuck in "Updating plan…".
+	watch(isStreaming, (streaming) => {
+		if (!streaming && updatingPlanRequestIds.size > 0) {
+			updatingPlanRequestIds.clear();
+		}
+	});
+
 	// --- Confirmations ---
 
 	async function confirmAction(
@@ -892,6 +926,8 @@ export function createThreadRuntime(threadId: string, hooks: ThreadRuntimeHooks)
 		sseState,
 		lastEventId,
 		amendContext,
+		activePlanEdit,
+		updatingPlanRequestIds,
 
 		// computeds
 		isStreaming,
@@ -918,6 +954,10 @@ export function createThreadRuntime(threadId: string, hooks: ThreadRuntimeHooks)
 		cancelRun,
 		cancelBackgroundTask,
 		amendAgent,
+		startPlanEdit,
+		cancelPlanEdit,
+		markPlanUpdatePending,
+		clearPlanUpdatePending,
 		confirmAction,
 		confirmResourceDecision,
 		resolveConfirmation,
